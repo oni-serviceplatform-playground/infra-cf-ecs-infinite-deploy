@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Task Failure Monitoring with Google Chat Notifications'
+
+Parameters:
+  GoogleChatWebhookUrl:
+    Type: String
+    Description: Google Chat Webhook URL for notifications
+    NoEcho: true
+  
+  EnvironmentPrefix:
+    Type: String
+    Description: Environment prefix for resource naming (e.g., dev-an2d, stg-an2s, prd-an2p)
+    Default: 'dev-an2d'
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      Name: Development
+    stg:
+      Name: Staging
+    prd:
+      Name: Production
+
+Resources:
+  # SNS Topic for notifications
+  ECSFailureNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentPrefix}-ecs-task-failure-topic'
+      DisplayName: ECS Task Failure Notifications
+      Tags:
+        - Key: Department
+          Value: FinOps
+        - Key: Environment
+          Value: !FindInMap
+            - EnvironmentMap
+            - !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+            - Name
+        - Key: Customer
+          Value: 'OpsNow. Inc'
+        - Key: Owner
+          Value: service_platform@opsnow.com
+        - Key: Project
+          Value: !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-ecs-task-failure-topic'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentPrefix}-lambda-ecs-notifier-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Department
+          Value: FinOps
+        - Key: Environment
+          Value: !FindInMap
+            - EnvironmentMap
+            - !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+            - Name
+        - Key: Customer
+          Value: 'OpsNow. Inc'
+        - Key: Owner
+          Value: service_platform@opsnow.com
+        - Key: Project
+          Value: !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-lambda-ecs-notifier-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Function for Google Chat notification
+  GoogleChatNotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentPrefix}-ecs-task-failure-gchat-notifier'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          WEBHOOK_URL: !Ref GoogleChatWebhookUrl
+          ENVIRONMENT: !Ref EnvironmentPrefix
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib3
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              webhook_url = os.environ['WEBHOOK_URL']
+              environment = os.environ['ENVIRONMENT']
+              http = urllib3.PoolManager()
+              
+              try:
+                  # Parse SNS message
+                  sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                  
+                  # Extract ECS task details
+                  detail = sns_message.get('detail', {})
+                  cluster_arn = detail.get('clusterArn', 'Unknown')
+                  cluster_name = cluster_arn.split('/')[-1] if '/' in cluster_arn else cluster_arn
+                  
+                  task_arn = detail.get('taskArn', 'Unknown')
+                  task_id = task_arn.split('/')[-1] if '/' in task_arn else task_arn
+                  
+                  # Get service name from group
+                  group = detail.get('group', '')
+                  service_name = group.replace('service:', '') if group.startswith('service:') else group
+                  
+                  # Get stop reason and code
+                  stop_code = detail.get('stopCode', 'Unknown')
+                  stopped_reason = detail.get('stoppedReason', 'No reason provided')
+                  
+                  # Define normal stop patterns (whitelist)
+                  NORMAL_STOP_CODES = ['UserInitiated', 'SpotInterruption']
+                  
+                  # Normal reasons for ServiceSchedulerInitiated
+                  NORMAL_SERVICE_REASONS = [
+                      'scaling activity initiated',
+                      'deployment',
+                      'desired count',
+                      'steady state',
+                      'updated computedsiredcount'
+                  ]
+                  
+                  # Filter out normal stops
+                  if stop_code in NORMAL_STOP_CODES:
+                      print(f"Skipping normal stop: {stop_code}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(f'Normal stop ({stop_code}) - no alert sent')
+                      }
+                  
+                  # For ServiceSchedulerInitiated, check if it's a normal operation
+                  if stop_code == 'ServiceSchedulerInitiated':
+                      reason_lower = stopped_reason.lower()
+                      # Skip if it's normal scaling/deployment AND doesn't have failure indicators
+                      is_normal = any(normal in reason_lower for normal in NORMAL_SERVICE_REASONS)
+                      has_failure = 'failed' in reason_lower or 'health check' in reason_lower or 'unhealthy' in reason_lower
+                      
+                      if is_normal and not has_failure:
+                          print(f"Skipping normal service operation: {stopped_reason}")
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps('Normal service operation - no alert sent')
+                          }
+                  
+                  # Get container exit info
+                  containers = detail.get('containers', [])
+                  failed_containers = []
+                  for container in containers:
+                      if container.get('exitCode') and container['exitCode'] != 0:
+                          failed_containers.append(f"{container.get('name', 'unknown')} (exit: {container['exitCode']})")
+                  
+                  # Get timestamp
+                  stopped_at = detail.get('stoppedAt', datetime.utcnow().isoformat())
+                  
+                  # Get region from task ARN
+                  region = task_arn.split(':')[3] if ':' in task_arn else 'ap-northeast-2'
+                  
+                  # Create message
+                  message = f"🚨 *ECS Task Failed in {environment.upper()} (Infinite Restart Alert)*\n\n"
+                  message += f"*Cluster:* `{cluster_name}`\n"
+                  message += f"*Service:* `{service_name}`\n"
+                  message += f"*Stop Code:* `{stop_code}`\n"
+                  message += f"*Reason:* {stopped_reason}\n"
+                  
+                  if failed_containers:
+                      message += f"*Failed Containers:* {', '.join(failed_containers)}\n"
+                  
+                  message += f"*Time:* {stopped_at}\n"
+                  message += f"*Region:* {region}\n\n"
+                  message += f"[View in Console](https://console.aws.amazon.com/ecs/v2/clusters/{cluster_name}/services/{service_name}/tasks/{task_id}?region={region})"
+                  
+                  # Send to Google Chat
+                  google_chat_message = {
+                      "text": message
+                  }
+                  
+                  response = http.request(
+                      'POST',
+                      webhook_url,
+                      body=json.dumps(google_chat_message).encode('utf-8'),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  print(f"Google Chat response: {response.status}")
+                  return {
+                      'statusCode': response.status,
+                      'body': json.dumps('Notification sent successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  print(f"Event: {json.dumps(event)}")
+                  raise e
+      Tags:
+        - Key: Department
+          Value: FinOps
+        - Key: Environment
+          Value: !FindInMap
+            - EnvironmentMap
+            - !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+            - Name
+        - Key: Customer
+          Value: 'OpsNow. Inc'
+        - Key: Owner
+          Value: service_platform@opsnow.com
+        - Key: Project
+          Value: !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-ecs-task-failure-gchat-notifier'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda permission for SNS
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GoogleChatNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref ECSFailureNotificationTopic
+
+  # SNS Subscription
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref ECSFailureNotificationTopic
+      Endpoint: !GetAtt GoogleChatNotifierFunction.Arn
+
+  # EventBridge Rule for ECS Task State Changes
+  ECSTaskFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}-ecs-task-stopped-rule'
+      Description: Capture ECS tasks that stopped with failure
+      State: ENABLED
+      EventPattern: |
+        {
+          "source": ["aws.ecs"],
+          "detail-type": ["ECS Task State Change"],
+          "detail": {
+            "lastStatus": ["STOPPED"]
+          }
+        }
+      Targets:
+        - Arn: !Ref ECSFailureNotificationTopic
+          Id: SNSTarget
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 600
+            MaximumRetryAttempts: 2
+
+  # EventBridge Rule Permission for SNS
+  EventBridgeToSNSPermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ECSFailureNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - SNS:Publish
+            Resource: !Ref ECSFailureNotificationTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ECSTaskFailureRule.Arn
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS Topic for ECS failure notifications
+    Value: !Ref ECSFailureNotificationTopic
+    Export:
+      Name: !Sub '${EnvironmentPrefix}-ecs-sns-topic-arn'
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function for Google Chat notifications
+    Value: !Ref GoogleChatNotifierFunction
+    Export:
+      Name: !Sub '${EnvironmentPrefix}-ecs-lambda-function'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule
+    Value: !Ref ECSTaskFailureRule
+    Export:
+      Name: !Sub '${EnvironmentPrefix}-ecs-event-rule'
