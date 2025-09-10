@@ -119,6 +119,15 @@ Resources:
                   
                   # Get service name from group
                   group = detail.get('group', '')
+                  
+                  # Filter out batch jobs (family: prefix)
+                  if group.startswith('family:'):
+                      print(f"Skipping batch job: {group}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Batch job completed - no alert sent')
+                      }
+                  
                   service_name = group.replace('service:', '') if group.startswith('service:') else group
                   
                   # Get stop reason and code
