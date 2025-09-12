@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Task Failure AlertNow Integration Lambda in Common Account'
+
+Parameters:
+  AlertNowWebhookUrl:
+    Type: String
+    Description: AlertNow ITGR Webhook URL for notifications
+    NoEcho: true
+    Default: 'https://alertnowitgr.opsnow.com/integration/standard/v1/9dfa2ece68ec5311f05bed1806b77546d703'
+  
+  ExistingSNSTopicArn:
+    Type: String
+    Description: Existing SNS Topic ARN to subscribe to
+    Default: 'arn:aws:sns:ap-northeast-2:971924526134:com-an2p-abnormal-resource-event-topic'
+
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: com-an2p-lambda-ecs-alertnow-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Department
+          Value: FinOps
+        - Key: Environment
+          Value: Common
+        - Key: Customer
+          Value: 'OpsNow. Inc'
+        - Key: Owner
+          Value: service_platform@opsnow.com
+        - Key: Project
+          Value: common
+        - Key: Name
+          Value: com-an2p-lambda-ecs-alertnow-role
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Function for AlertNow notification
+  AlertNowNotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: com-an2p-ecs-task-failure-alertnow-notifier
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          WEBHOOK_URL: !Ref AlertNowWebhookUrl
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib3
+          from datetime import datetime
+          
+          http = urllib3.PoolManager()
+          
+          # Define normal stop codes and reasons (same as original Lambda)
+          NORMAL_STOP_CODES = ['UserInitiated', 'SpotInterruption']
+          NORMAL_SERVICE_REASONS = [
+              'scaling activity initiated',
+              'deployment',
+              'desired count',
+              'steady state',
+              'updated computedsiredcount'
+          ]
+          
+          def lambda_handler(event, context):
+              webhook_url = os.environ.get('WEBHOOK_URL')
+              
+              # Parse the SNS message
+              try:
+                  sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                  detail = sns_message.get('detail', {})
+              except (KeyError, json.JSONDecodeError) as e:
+                  print(f"Error parsing SNS message: {e}")
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Invalid SNS message format')
+                  }
+              
+              # Extract environment from the event
+              environment = detail.get('environment', 'unknown')
+              
+              # Get service name from group
+              group = detail.get('group', '')
+              
+              # Filter out batch jobs (family: prefix)
+              if group.startswith('family:'):
+                  print(f"Skipping batch job: {group}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Batch job completed - no alert sent')
+                  }
+              
+              service_name = group.replace('service:', '') if group.startswith('service:') else group
+              
+              # Get stop reason and code
+              stop_code = detail.get('stopCode', 'Unknown')
+              stopped_reason = detail.get('stoppedReason', 'No reason provided')
+              
+              # Filter out normal stops
+              if stop_code in NORMAL_STOP_CODES:
+                  print(f"Skipping normal stop: {stop_code}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Normal stop - no alert sent')
+                  }
+              
+              # Special handling for ServiceSchedulerInitiated
+              if stop_code == 'ServiceSchedulerInitiated':
+                  # Check if it's a normal scaling/deployment activity
+                  if any(reason in stopped_reason.lower() for reason in NORMAL_SERVICE_REASONS):
+                      print(f"Skipping normal service activity: {stopped_reason}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Normal service activity - no alert sent')
+                      }
+              
+              # Extract cluster and task information
+              cluster_arn = detail.get('clusterArn', 'Unknown')
+              cluster_name = cluster_arn.split('/')[-1] if '/' in cluster_arn else cluster_arn
+              
+              task_arn = detail.get('taskArn', 'Unknown')
+              task_id = task_arn.split('/')[-1] if '/' in task_arn else task_arn
+              
+              # Get timestamp
+              event_time = sns_message.get('time', datetime.utcnow().isoformat())
+              
+              # Prepare AlertNow payload
+              alert_payload = {
+                  "summary": f"ECS Task Failed in {environment.upper()}: {service_name}",
+                  "status": "open",
+                  "urgency": "high",
+                  "event_time": event_time,
+                  "metric_name": stop_code,
+                  "threshold": "N/A",
+                  "metric_value": stopped_reason,
+                  "resource_name": f"{cluster_name}/{service_name}",
+                  "event_type": "ERROR",
+                  "custom_details": {
+                      "environment": environment,
+                      "cluster": cluster_name,
+                      "service": service_name,
+                      "task_id": task_id,
+                      "stop_code": stop_code,
+                      "stopped_reason": stopped_reason,
+                      "region": sns_message.get('region', 'ap-northeast-2'),
+                      "account": sns_message.get('account', 'unknown')
+                  }
+              }
+              
+              # Send to AlertNow
+              try:
+                  response = http.request(
+                      'POST',
+                      webhook_url,
+                      body=json.dumps(alert_payload).encode('utf-8'),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  print(f"AlertNow response: {response.status}")
+                  print(f"Response body: {response.data.decode('utf-8')}")
+                  
+                  if response.status == 200:
+                      print("Successfully sent alert to AlertNow")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Alert sent successfully')
+                      }
+                  else:
+                      print(f"Failed to send alert. Status: {response.status}")
+                      return {
+                          'statusCode': response.status,
+                          'body': json.dumps(f'Failed to send alert: {response.status}')
+                      }
+                  
+              except Exception as e:
+                  print(f"Error sending to AlertNow: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error sending alert: {str(e)}')
+                  }
+      Tags:
+        - Key: Department
+          Value: FinOps
+        - Key: Environment
+          Value: Common
+        - Key: Customer
+          Value: 'OpsNow. Inc'
+        - Key: Owner
+          Value: service_platform@opsnow.com
+        - Key: Project
+          Value: common
+        - Key: Name
+          Value: com-an2p-ecs-task-failure-alertnow-notifier
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Permission for SNS to invoke
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertNowNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref ExistingSNSTopicArn
+
+  # SNS Subscription to existing topic
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref ExistingSNSTopicArn
+      Endpoint: !GetAtt AlertNowNotifierFunction.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt AlertNowNotifierFunction.Arn
+    Export:
+      Name: com-an2p-alertnow-lambda-arn
+  
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref AlertNowNotifierFunction
+    Export:
+      Name: com-an2p-alertnow-lambda-name

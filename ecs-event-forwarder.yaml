@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Event Forwarder to Common Account SNS Topic'
+
+Parameters:
+  TargetSNSArn:
+    Type: String
+    Description: Target SNS Topic ARN in common account
+    NoEcho: true
+    Default: 'arn:aws:sns:ap-northeast-2:971924526134:com-an2p-abnormal-resource-event-topic'
+  
+  EnvironmentPrefix:
+    Type: String
+    Description: Environment prefix for resource naming (e.g., dev-an2d, stg-an2s, prd-an2p)
+    Default: 'dev-an2d'
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      Name: Development
+    stg:
+      Name: Staging
+    prd:
+      Name: Production
+
+Resources:
+  # IAM Role for EventBridge to publish to cross-account SNS
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentPrefix}-eventbridge-sns-forwarder-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref TargetSNSArn
+      Tags:
+        - Key: Department
+          Value: FinOps
+        - Key: Environment
+          Value: !FindInMap
+            - EnvironmentMap
+            - !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+            - Name
+        - Key: Customer
+          Value: 'OpsNow. Inc'
+        - Key: Owner
+          Value: service_platform@opsnow.com
+        - Key: Project
+          Value: !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-eventbridge-sns-forwarder-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge Rule to capture ECS Task failures
+  ECSEventForwarderRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}-ecs-event-forwarder-rule'
+      Description: Forward ECS Task State Changes to Common Account SNS
+      EventPattern: |
+        {
+          "source": ["aws.ecs"],
+          "detail-type": ["ECS Task State Change"],
+          "detail": {
+            "lastStatus": ["STOPPED"]
+          }
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !Ref TargetSNSArn
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Id: '1'
+          InputTransformer:
+            InputPathsMap:
+              account: "$.account"
+              region: "$.region"
+              time: "$.time"
+              clusterArn: "$.detail.clusterArn"
+              taskArn: "$.detail.taskArn"
+              stopCode: "$.detail.stopCode"
+              stoppedReason: "$.detail.stoppedReason"
+              group: "$.detail.group"
+            InputTemplate: !Sub |
+              {
+                "version": "0",
+                "id": "$context.requestId",
+                "detail-type": "ECS Task State Change",
+                "source": "aws.ecs",
+                "account": "<account>",
+                "time": "<time>",
+                "region": "<region>",
+                "resources": [],
+                "detail": {
+                  "environment": "${EnvironmentPrefix}",
+                  "clusterArn": "<clusterArn>",
+                  "taskArn": "<taskArn>",
+                  "lastStatus": "STOPPED",
+                  "stopCode": "<stopCode>",
+                  "stoppedReason": "<stoppedReason>",
+                  "group": "<group>"
+                }
+              }
+
+Outputs:
+  EventRuleArn:
+    Description: ARN of the EventBridge Rule
+    Value: !GetAtt ECSEventForwarderRule.Arn
+    Export:
+      Name: !Sub '${EnvironmentPrefix}-ecs-event-rule-arn'
+  
+  IAMRoleArn:
+    Description: ARN of the IAM Role for EventBridge
+    Value: !GetAtt EventBridgeRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentPrefix}-eventbridge-role-arn'

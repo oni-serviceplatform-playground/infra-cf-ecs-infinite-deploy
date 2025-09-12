@@ -1,11 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'ECS Task Failure Monitoring with Google Chat Notifications'
+Description: 'ECS Task Failure Monitoring with AlertNow ITGR Notifications'
 
 Parameters:
-  GoogleChatWebhookUrl:
+  AlertNowWebhookUrl:
     Type: String
-    Description: Google Chat Webhook URL for notifications
+    Description: AlertNow ITGR Webhook URL for notifications
     NoEcho: true
+    Default: 'https://alertnowitgr.opsnow.com/integration/standard/v1/9dfa2ece68ec5311f05bed1806b77546d703'
   
   EnvironmentPrefix:
     Type: String
@@ -20,6 +21,12 @@ Mappings:
       Name: Staging
     prd:
       Name: Production
+    mea:
+      Name: MiddleEast
+    usa:
+      Name: USWest
+    us2:
+      Name: USEast
 
 Resources:
   # SNS Topic for notifications
@@ -80,18 +87,18 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
-  # Lambda Function for Google Chat notification
-  GoogleChatNotifierFunction:
+  # Lambda Function for AlertNow notification
+  AlertNowNotifierFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${EnvironmentPrefix}-ecs-task-failure-gchat-notifier'
+      FunctionName: !Sub '${EnvironmentPrefix}-ecs-task-failure-alertnow-notifier'
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 30
       Environment:
         Variables:
-          WEBHOOK_URL: !Ref GoogleChatWebhookUrl
+          WEBHOOK_URL: !Ref AlertNowWebhookUrl
           ENVIRONMENT: !Ref EnvironmentPrefix
       Code:
         ZipFile: |
@@ -181,37 +188,79 @@ Resources:
                   # Get region from task ARN
                   region = task_arn.split(':')[3] if ':' in task_arn else 'ap-northeast-2'
                   
-                  # Create message
-                  message = f"🚨 *ECS Task Failed in {environment.upper()} (Infinite Restart Alert)*\n\n"
-                  message += f"*Cluster:* `{cluster_name}`\n"
-                  message += f"*Service:* `{service_name}`\n"
-                  message += f"*Stop Code:* `{stop_code}`\n"
-                  message += f"*Reason:* {stopped_reason}\n"
+                  # Get account from SNS message
+                  account = sns_message.get('account', 'unknown')
+                  
+                  # Extract environment name (first part before dash)
+                  env_name = environment.split('-')[0].upper() if '-' in environment else environment.upper()
+                  
+                  # Build console link
+                  console_link = f"https://console.aws.amazon.com/ecs/v2/clusters/{cluster_name}/services/{service_name}/tasks/{task_id}?region={region}"
+                  
+                  # Build detailed summary for AlertNow
+                  summary_lines = [
+                      f"ECS Task Failed in {env_name} (Infinite Restart Alert)",
+                      f"",
+                      f"Cluster: {cluster_name}",
+                      f"Service: {service_name}",
+                      f"Stop Code: {stop_code}",
+                      f"Reason: {stopped_reason}"
+                  ]
                   
                   if failed_containers:
-                      message += f"*Failed Containers:* {', '.join(failed_containers)}\n"
+                      summary_lines.append(f"Failed Containers: {', '.join(failed_containers)}")
                   
-                  message += f"*Time:* {stopped_at}\n"
-                  message += f"*Region:* {region}\n\n"
-                  message += f"[View in Console](https://console.aws.amazon.com/ecs/v2/clusters/{cluster_name}/services/{service_name}/tasks/{task_id}?region={region})"
+                  summary_lines.append(f"Region: {region}")
                   
-                  # Send to Google Chat
-                  google_chat_message = {
-                      "text": message
+                  detailed_summary = "\\n".join(summary_lines)
+                  
+                  # Prepare AlertNow payload
+                  alert_payload = {
+                      "summary": detailed_summary,
+                      "status": "open",
+                      "urgency": console_link,
+                      "event_time": stopped_at,
+                      "metric_name": stop_code,
+                      "threshold": "N/A",
+                      "metric_value": stopped_reason,
+                      "resource_name": f"{cluster_name}/{service_name}",
+                      "event_type": "ERROR",
+                      "custom_details": {
+                          "environment": environment,
+                          "cluster": cluster_name,
+                          "service": service_name,
+                          "task_id": task_id,
+                          "stop_code": stop_code,
+                          "stopped_reason": stopped_reason,
+                          "failed_containers": ', '.join(failed_containers) if failed_containers else 'None',
+                          "region": region,
+                          "account": account
+                      }
                   }
                   
+                  # Send to AlertNow
                   response = http.request(
                       'POST',
                       webhook_url,
-                      body=json.dumps(google_chat_message).encode('utf-8'),
+                      body=json.dumps(alert_payload).encode('utf-8'),
                       headers={'Content-Type': 'application/json'}
                   )
                   
-                  print(f"Google Chat response: {response.status}")
-                  return {
-                      'statusCode': response.status,
-                      'body': json.dumps('Notification sent successfully')
-                  }
+                  print(f"AlertNow response: {response.status}")
+                  print(f"Response body: {response.data.decode('utf-8')}")
+                  
+                  if response.status == 200:
+                      print("Successfully sent alert to AlertNow")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Alert sent to AlertNow successfully')
+                      }
+                  else:
+                      print(f"Failed to send alert. Status: {response.status}")
+                      return {
+                          'statusCode': response.status,
+                          'body': json.dumps(f'Failed to send alert: {response.status}')
+                      }
                   
               except Exception as e:
                   print(f"Error: {str(e)}")
@@ -232,7 +281,7 @@ Resources:
         - Key: Project
           Value: !Select [0, !Split ['-', !Ref EnvironmentPrefix]]
         - Key: Name
-          Value: !Sub '${EnvironmentPrefix}-ecs-task-failure-gchat-notifier'
+          Value: !Sub '${EnvironmentPrefix}-ecs-task-failure-alertnow-notifier'
         - Key: ManagedBy
           Value: CloudFormation
 
@@ -240,7 +289,7 @@ Resources:
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref GoogleChatNotifierFunction
+      FunctionName: !Ref AlertNowNotifierFunction
       Action: lambda:InvokeFunction
       Principal: sns.amazonaws.com
       SourceArn: !Ref ECSFailureNotificationTopic
@@ -251,7 +300,7 @@ Resources:
     Properties:
       Protocol: lambda
       TopicArn: !Ref ECSFailureNotificationTopic
-      Endpoint: !GetAtt GoogleChatNotifierFunction.Arn
+      Endpoint: !GetAtt AlertNowNotifierFunction.Arn
 
   # EventBridge Rule for ECS Task State Changes
   ECSTaskFailureRule:
@@ -302,8 +351,8 @@ Outputs:
       Name: !Sub '${EnvironmentPrefix}-ecs-sns-topic-arn'
 
   LambdaFunctionName:
-    Description: Name of the Lambda function for Google Chat notifications
-    Value: !Ref GoogleChatNotifierFunction
+    Description: Name of the Lambda function for AlertNow notifications
+    Value: !Ref AlertNowNotifierFunction
     Export:
       Name: !Sub '${EnvironmentPrefix}-ecs-lambda-function'
 

@@ -2,6 +2,17 @@
 
 ECS 태스크가 비정상 종료될 때 Google Chat으로 실시간 알림을 보내는 모니터링 시스템입니다.
 
+## 📐 Architecture Options
+
+### Option 1: Single Account (Default)
+단일 계정에서 모든 컴포넌트를 관리하는 방식
+- `ecs-task-failure-monitoring.yaml` - EventBridge, SNS, Lambda를 모두 포함
+
+### Option 2: Multi-Account with Cross-Account SNS  
+소스 계정에서 공통 계정의 SNS로 이벤트를 직접 전송하는 방식
+- `ecs-event-forwarder.yaml` - 소스 계정용 EventBridge Rule과 IAM Role
+- 공통 계정의 SNS Topic으로 이벤트 전송
+
 ## 🎯 주요 기능
 
 - ECS 태스크 실패 실시간 감지
@@ -18,12 +29,14 @@ ECS 태스크가 비정상 종료될 때 Google Chat으로 실시간 알림을 �
 
 ## 🚀 배포 방법
 
-### 1. Google Chat Webhook URL 준비
+### Option 1: Single Account Deployment
+
+#### 1. Google Chat Webhook URL 준비
 
 1. Google Chat 스페이스에서 Webhook 생성
 2. URL 복사 (형식: `https://chat.googleapis.com/v1/spaces/XXX/messages?key=YYY&token=ZZZ`)
 
-### 2. CloudFormation 스택 배포
+#### 2. CloudFormation 스택 배포
 
 ```bash
 # 기본 배포 (dev-an2d 환경, 모든 ECS 클러스터 모니터링)
@@ -45,6 +58,56 @@ aws cloudformation deploy \
     EnvironmentPrefix=dev-an2d \
   --capabilities CAPABILITY_NAMED_IAM \
   --region ap-northeast-2
+```
+
+### Option 2: Multi-Account Deployment (Cross-Account SNS)
+
+소스 계정에서 공통 계정의 SNS Topic으로 이벤트를 직접 전송하는 구조입니다.
+
+#### 1. 소스 계정에 Event Forwarder 배포
+
+```bash
+# 기본 배포 (dev-an2d 환경)
+./deploy-forwarder.sh
+
+# 환경 지정
+./deploy-forwarder.sh stg-an2s
+
+# 커스텀 SNS ARN 지정
+./deploy-forwarder.sh dev-an2d arn:aws:sns:ap-northeast-2:971924526134:com-an2p-abnormal-resource-event-topic
+
+# AWS CLI 직접 사용
+aws cloudformation deploy \
+  --template-file ecs-event-forwarder.yaml \
+  --stack-name dev-an2d-ecs-event-forwarder-stack \
+  --parameter-overrides \
+    EnvironmentPrefix=dev-an2d \
+    TargetSNSArn=arn:aws:sns:ap-northeast-2:971924526134:com-an2p-abnormal-resource-event-topic \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region ap-northeast-2
+```
+
+#### 2. 공통 계정 SNS Topic 권한 설정
+
+공통 계정의 SNS Topic에 소스 계정들이 Publish할 수 있도록 Resource Policy 추가가 필요합니다.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Service": "events.amazonaws.com"
+    },
+    "Action": "SNS:Publish",
+    "Resource": "arn:aws:sns:ap-northeast-2:971924526134:com-an2p-abnormal-resource-event-topic",
+    "Condition": {
+      "StringEquals": {
+        "aws:SourceAccount": ["SOURCE_ACCOUNT_ID_1", "SOURCE_ACCOUNT_ID_2"]
+      }
+    }
+  }]
+}
 ```
 
 ## 📊 모니터링 대상 이벤트
@@ -87,8 +150,10 @@ Region: ap-northeast-2
 
 ```
 .
-├── ecs-task-failure-monitoring.yaml  # CloudFormation 템플릿
-├── deploy.sh                         # 배포 스크립트
+├── ecs-task-failure-monitoring.yaml  # Single Account용 CloudFormation 템플릿
+├── deploy.sh                         # Single Account 배포 스크립트
+├── ecs-event-forwarder.yaml         # Multi-Account용 Event Forwarder 템플릿
+├── deploy-forwarder.sh               # Event Forwarder 배포 스크립트
 └── README.md                          # 이 문서
 ```
 
