@@ -141,6 +141,14 @@ Resources:
                   stop_code = detail.get('stopCode', 'Unknown')
                   stopped_reason = detail.get('stoppedReason', 'No reason provided')
                   
+                  # Filter out maintenance events
+                  if 'maintenance' in stopped_reason.lower() or 'ECS is performing maintenance' in stopped_reason:
+                      print(f"Skipping maintenance event: {stopped_reason}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Maintenance event ignored')
+                      }
+                  
                   # Define normal stop patterns (whitelist)
                   NORMAL_STOP_CODES = ['UserInitiated', 'SpotInterruption']
                   
